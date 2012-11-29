@@ -1,0 +1,498 @@
+#!/bin/bash
+############################################################################
+#
+# mirror Version 3.28 By Stu Sheldon stu@actusa.net
+# 
+# I wish I could take the credit for coming up with this idea, but I got the
+# entire concept for this from Mike Rubel @ Caltech. Thank you Mike, Great
+# idea! And thanks for presenting this to our local LUG!
+#
+# ============================== Disclaimer ===============================
+#
+# Don't even begin to think there is any kind of warranty on this script!
+# If it destroys your box, it's not my problem. If your dog is standing next
+# to your PC when it self destructs and get's his tail blown to the next
+# room, don't come to me!
+#
+# =========================================================================
+#
+# This script is more or less a quickie that I popped out to allow me to
+# take snapshots of certain data on development equipment and store it to
+# a central system. It works for me... If you can use it then have at it!
+#
+# What it does:
+#
+# mirror does an rsync in the directories listed in the 'allsrcs' variable
+# and then creates hard links to those files in a directory hierarchy to keep
+# snapshots of the rsync's at given intervals. In simple terms, it allows you
+# to store snapshots of the directories you want to backup. Since it uses hard
+# links for previous data, it is very easy on disk space.
+#
+# What is "EXPERIMENTAL" in this script:
+#
+# If you read down through the settings, you will see a couple of settings that
+# are listed as experimental:
+# autosrcdir=
+# advexcludes=
+# Please read the instructions regarding these, and report any problems you
+# might have with them. They seem to work properly for me, but they have very
+# limited testing under their belt.
+#
+# Instructions:
+# 
+# The first thing you need to do is go down to the end of this header section
+# and set all the user defined variables in the user settings section.
+# They have a brief description of what they do and how they should be set.
+#
+# There are two areas at the bottom of configuration section that allow you to
+# do pre and post executions of commands. The only reason I can see to use
+# these areas would be if you are trying to rsync a windows box and need to
+# mount smb shares on the system you are running the script on. If that's your
+# goal, then add your commands for mounting and unmounting those filesystems
+# there.
+#
+# Once that is done, you can run the program.
+#
+# mirror supports one command line switches ( -s ).
+#	-s = run sync mode only
+#
+# Sync mode should be ran the first time you setup mirror. Otherwise, use 
+# no switch.
+# Once you have run mirror for the first time, you will find that it has setup
+# a directory hierarchy in your backup root directory:
+#
+#	/<backuproot>/<hostid>         ( host root )
+#	/<backuproot>/<hostid>/working ( working directory )
+#	/<backuproot>/<hostid>/hourly  ( hourly saves )
+#	/<backuproot>/<hostid>/daily   ( daily saves )
+#	/<backuproot>/<hostid>/weekly  ( weekly saves )
+#
+# The directories are named 'image-<year>-<month>-<day>-<hour>'
+#
+# Each time mirror runs, it date stamps a file in the <hostid> directory called
+# 'lastrun.time'. This file's date when listing it using ls -laF shows the last
+# date and time mirror ran on that host.
+#
+# The last thing you need to do is add mirror in your crontab with the proper
+# times and switches.
+#
+# If you are going for hourly sync's, add the following to your crontab:
+# 0 * * * *    /usr/local/sbin/mirror
+#
+# Every four hours would be:
+# 0 0,4,8,12,16,20  * * *    /usr/local/sbin/mirror
+#
+# Every six hours:
+# 0 0,6,12,18 * * *    /usr/local/sbin/mirror
+#
+# You get the picture.
+#
+# And that's it! Enjoy...
+#
+############################################################################
+
+# Start User Config Stuff
+
+# Am I saving files from my local system to a remote backup server?
+# If so, set rmt to 1
+
+rmt=0
+
+# If rmt > 0 what is the login?
+
+rmtlogin=""
+rmthost=""
+
+# This is an array of the directories you want to mirror.
+# Don't forget to split them with white space and enclose them in '"' quotes.
+
+allsrcdir="
+/home
+"
+
+# The autosrcdir is a bit experimental. If this is set to -gt 0, the script
+# will make a half hearted effort to create a list of all directories in the
+# root of the system to be backed up. Turns out that if you want to use the
+# --delete and or --delete-excluded switches, you can not use '/' as a source.
+
+autosrcdir=0
+
+# You need to set the backedhost and host ID. The backedhost should be the FQDN
+# name or IP address you will be backing up, it is ignored if you have set rmt
+# to 1. The host ID is the name of the directory just above the root of the
+# backup root directory, the host name might be a good choice here.
+# if you are backing up locally, or have set rmt to 1, just leave backedhost
+# blank. Never leave hostid blank.
+
+backedhost=""
+hostid="homer"
+
+# This is new and experimental. It's designed to allow for more "exact"
+# filtering of source files. These are files we would usually consider to be
+# useless during a restore. If you don't like this, or want to disable it,
+# just change the advexclude flag to 0.
+
+advexcludes=1
+
+excludesfile="/tmp/excludes-${hostid}"
+
+cat > ${excludesfile} << EOF
+## Settings for udevd
+- /dev/.static/dev/pts/*
+- /dev/.static/dev/shm/*
++ /dev/.static/***
+- /dev/*
+
+## Settings for Static Dev
+#- /dev/pts/*
+#- /dev/shm/*
+
+- /proc/*
+- /sys/*
+- /mnt/*
+- /cdrom/*
+- /media/*
++ *
+EOF
+
+EXCLUDES="--filter=. ${excludesfile}"
+
+# This is the local root of the backup directories. (where to backup to)
+
+backuproot=/home/backroot
+
+# How far back do you want to go? The default settings are for:
+# save last 4 hour snaps
+# save last 7 day snaps
+# save last 1 week snaps
+# If you want to save week snapshots, you must at least have savedays set to
+# 7, if not, the program will force savedays to 7. Weeks are considered to be
+# Sunday morning snapshots. So make sure you run the script on all 7 days. 
+# You also need to set the newday hour to 00-23 depending on what hour you run
+# the script in cron.
+
+newday=00
+saveweeks=1
+savedays=7
+savehours=4
+
+# Mount and Dismount commands for all reasons are in the following functions
+
+mounting ()
+{
+precom=0
+# ssh ${backedhost} "dpkg --get-selections > /etc/current.packages"
+# ssh ${backedhost} "apt-get clean"
+# ssh ${backedhost} "yum clean all"
+# dpkg --get-selections > /etc/current.packages
+# apt-get clean
+# mount -t smbfs -o ro,username=backup,password=letmein \
+# 	//peanuts/data /nt-fs/pea-cdr \
+#	|| mountfail
+}
+
+umounting ()
+{
+postcom=0
+# umount /nt-fs/pea-cdr \
+#	|| umountfail
+}
+
+# Uncomment the rsync command that best suits your needs. Select only one.
+
+# Typical Unix using ssh and public keys and no logging
+#rsync="rsync -aR -q  --numeric-ids --delete --delete-excluded"
+
+# Typical Unix using ssh and public keys and with logging
+rsync="rsync -aR -v  --numeric-ids --delete --delete-excluded"
+
+# This has settings for windows and expects to use a mounted share.
+# rsync="rsync -a -R -q --delete --modify-window=10"
+
+# End User Config Stuff
+
+############################################################################
+
+# Start Static Code
+
+unalias -a
+cmdline=$1
+cp="cp -alf"
+weekdir=${backuproot}/${hostid}/weekly
+daydir=${backuproot}/${hostid}/daily
+hourdir=${backuproot}/${hostid}/hourly
+working=${backuproot}/${hostid}/working
+lockfile=${backuproot}/${hostid}/syncing-now
+logfile=${backuproot}/${hostid}/lastlog
+
+PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin
+datedir=`date +'image-%Y-%m-%d-%H'`
+dow=`date +'%w'`
+chour=`date +'%H'`
+lday=`date +'image-%Y-%m-%d-%H' -d '1 day ago'`
+lweek=`date +'image-%Y-%m-%d-%H' -d '1 week ago'`
+
+dodir ()
+{
+[ -d ${weekdir} ] || mkdir -p ${weekdir}
+[ -d ${daydir} ] || mkdir -p ${daydir}
+[ -d ${hourdir} ] || mkdir -p ${hourdir}
+[ -d ${working} ] || mkdir -p ${working}
+}
+
+rmtdodir ()
+{
+ssh -l ${rmtlogin} ${rmthost} "[ -d ${weekdir} ] || mkdir -p ${weekdir}"
+ssh -l ${rmtlogin} ${rmthost} "[ -d ${daydir} ] || mkdir -p ${daydir}"
+ssh -l ${rmtlogin} ${rmthost} "[ -d ${hourdir} ] || mkdir -p ${hourdir}"
+ssh -l ${rmtlogin} ${rmthost} "[ -d ${working} ] || mkdir -p ${working}"
+}
+
+doweek ()
+{
+[ ${saveweeks} -eq 0 ] && return
+if [ -d ${daydir}/${lweek} ]; then
+  mv ${daydir}/${lweek} ${weekdir}
+else
+  echo "I can't find a daily snapshot that is a week old..."
+fi
+}
+
+rmtdoweek ()
+{
+[ ${saveweeks} -eq 0 ] && return
+ssh -l ${rmtlogin} ${rmthost} "if [ -d ${daydir}/${lweek} ]; then
+  mv ${daydir}/${lweek} ${weekdir}
+else
+  echo \"I can't find a daily snapshot that is a week old...\"
+fi"
+}
+
+doday ()
+{
+[ ${savedays} -eq 0 ] && return
+if [ -d ${hourdir}/${lday} ]; then
+  mv ${hourdir}/${lday} ${daydir}
+else
+  echo "I can't find a hourly snapshot that is 24hrs old..."
+fi
+}
+
+rmtdoday ()
+{
+[ ${savedays} -eq 0 ] && return
+ssh -l ${rmtlogin} ${rmthost} "if [ -d ${hourdir}/${lday} ]; then
+  mv ${hourdir}/${lday} ${daydir}
+else
+  echo \"I can't find a hourly snapshot that is 24hrs old...\"
+fi"
+}
+
+dohour ()
+{
+${cp} ${working} ${hourdir}/${datedir}
+touch ${hourdir}/${datedir}
+}
+
+rmtdohour ()
+{
+ssh -l ${rmtlogin} ${rmthost} "${cp} ${working} ${hourdir}/${datedir}"
+ssh -l ${rmtlogin} ${rmthost} "touch ${hourdir}/${datedir}"
+}
+
+dosync ()
+{
+if [ ${autosrcdir} -gt 0 ]; then
+ if [ "${backedhost}" != "" ]; then
+    allsrcdir=`ssh ${backedhost} "ls -d /*"`
+  else
+    allsrcdir=`ls -d /*`
+  fi
+fi
+for srcdir in ${allsrcdir}; do
+  if [ "${backedhost}" != "" ]; then
+    if [ ${advexcludes} -gt 0 ]; then
+      ${rsync} "${EXCLUDES}" ${backedhost}:${srcdir} ${working} \
+	>> ${logfile}
+    else
+      ${rsync} ${backedhost}:${srcdir} ${working} \
+	>> ${logfile}
+    fi
+  else
+    if [ ${advexcludes} -gt 0 ]; then
+      ${rsync} "${EXCLUDES}" ${srcdir} ${working} \
+	>> ${logfile}
+    else
+      ${rsync} ${srcdir} ${working} \
+	>> ${logfile}
+    fi
+  fi
+done
+}
+
+rmtdosync ()
+{
+if [ ${autosrcdir} -gt 0 ]; then
+  allsrcdir=`ls -d /*`
+fi
+for srcdir in ${allsrcdir}; do
+  if [ ${advexcludes} -gt 0 ]; then
+    ${rsync} "${EXCLUDES}" ${srcdir} ${rmtlogin}@${rmthost}:${working} \
+	| ssh -l ${rmtlogin} ${rmthost} "cat - >> ${logfile}"
+  else
+    ${rsync} ${srcdir} ${rmtlogin}@${rmthost}:${working} \
+	| ssh -l ${rmtlogin} ${rmthost} "cat - >> ${logfile}"
+  fi
+done
+}
+
+docleanup ()
+{
+count=0
+[ ${savehours} -lt 1 ] && savehours=1
+for i in `ls -t ${hourdir}`; do
+  let count=count+1
+  if [ ${count} -gt ${savehours} ]; then
+    rm -Rf ${hourdir}/${i}
+  fi
+done
+count=0
+[ ${saveweeks} -gt 0 -a ${savedays} -lt 7 ] && savedays=7
+for i in `ls -t ${daydir}`; do
+  let count=count+1
+  if [ ${count} -gt ${savedays} ]; then
+    rm -Rf ${daydir}/${i}
+  fi
+done
+count=0
+for i in `ls -t ${weekdir}`; do
+  let count=count+1
+  if [ ${count} -gt ${saveweeks} ]; then
+    rm -Rf ${weekdir}/${i}
+  fi
+done
+}
+
+rmtdocleanup ()
+{
+count=0
+[ ${savehours} -lt 1 ] && savehours=1
+for i in `ssh -l ${rmtlogin} ${rmthost} "ls -t ${hourdir}"`; do
+  let count=count+1
+  if [ ${count} -gt ${savehours} ]; then
+    ssh -l ${rmtlogin} ${rmthost} "rm -Rf ${hourdir}/${i}"
+  fi
+done
+count=0
+[ ${saveweeks} -gt 0 -a ${savedays} -lt 7 ] && savedays=7
+for i in `ssh -l ${rmtlogin} ${rmthost} "ls -t ${daydir}"`; do
+  let count=count+1
+  if [ ${count} -gt ${savedays} ]; then
+    ssh -l ${rmtlogin} ${rmthost} "rm -Rf ${daydir}/${i}"
+  fi
+done
+count=0
+for i in `ssh -l ${rmtlogin} ${rmthost} "ls -t ${weekdir}"`; do
+  let count=count+1
+  if [ ${count} -gt ${saveweeks} ]; then
+    ssh -l ${rmtlogin} ${rmthost} "rm -Rf ${weekdir}/${i}"
+  fi
+done
+}
+
+inuse ()
+{
+echo "I am already syncing host ${hostid}"
+exit 1
+}
+
+mountfail ()
+{
+echo "I can't mount filesystem on host ${hostid}"
+exit 1
+}
+
+umountfail ()
+{
+echo "I can't unmount filesystem on host ${hostid}"
+exit 1
+}
+
+[ -f ${lockfile} ] && inuse
+
+mounting
+
+if [ ${rmt} -gt 0 ]; then
+  rmtdodir
+else
+  dodir
+fi
+
+if [ ${rmt} -gt 0 ]; then
+  ssh -l ${rmtlogin} ${rmthost} "touch ${lockfile}"
+  ssh -l ${rmtlogin} ${rmthost} "date > ${logfile}"
+else
+  touch ${lockfile}
+  date > ${logfile}
+fi
+
+
+case ${cmdline} in
+  -s)
+    if [ ${rmt} -gt 0 ]; then
+      rmtdosync
+    else
+      dosync
+    fi
+  ;;
+  *)
+    if [ ${rmt} -gt 0 ]; then
+      rmtdosync
+    else
+      dosync
+    fi
+    if [ ${rmt} -gt 0 ]; then
+      rmtdohour
+    else
+      dohour
+    fi
+    if [ ${newday} == ${chour} ]; then
+      if [ ${rmt} -gt 0 ]; then
+        rmtdoday
+      else
+        doday
+      fi
+    fi
+    if [ ${dow} == 0 -a ${newday} == ${chour} ]; then
+      if [ ${rmt} -gt 0 ]; then
+        rmtdoweek
+      else
+        doweek
+      fi
+    fi
+    if [ ${rmt} -gt 0 ]; then
+      rmtdocleanup
+    else
+      docleanup
+    fi
+  ;;
+esac
+
+if [ ${rmt} -gt 0 ]; then
+  ssh -l ${rmtlogin} ${rmthost} "touch ${backuproot}/${hostid}/lastrun.time"
+  ssh -l ${rmtlogin} ${rmthost} "rm -f ${lockfile}"
+  ssh -l ${rmtlogin} ${rmthost} "date >> ${logfile}"
+else
+  touch ${backuproot}/${hostid}/lastrun.time
+  rm -f ${lockfile}
+  date >> ${logfile}
+fi
+
+if [ ${advexcludes} -gt 0 ]; then
+  rm -f ${excludesfile}
+fi
+
+umounting
+
+echo "Backup for ${hostid} is complete..."
+
